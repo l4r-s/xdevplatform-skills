@@ -317,6 +317,25 @@ for post in client.stream.posts_sample():
 
 For detailed streaming patterns, reconnection strategies, and rule-building guidance, see [api-concepts.md](api-concepts.md).
 
+## Known Issues
+
+### OAuth1 Body-Read Bug (TypeScript XDK)
+
+**Bug:** When using OAuth1 authentication, the XDK reads the request body stream to compute the OAuth1 signature. When `fetch()` then tries to send the request, the body stream has already been consumed, causing: `Error [ApiError]: Body is unusable: Body has already been read`
+
+**Affected calls** (binary/large body data):
+- `client.media.upload()` (one-shot upload) -- always fails
+- `client.media.appendUpload()` (chunked APPEND) -- always fails
+
+**Unaffected calls** (small JSON or no body):
+- `client.posts.create()` -- works fine
+- `client.media.initializeUpload()` -- works fine (metadata only)
+- `client.media.finalizeUpload()` -- works fine (no body)
+
+**Workaround:** Use a hybrid approach -- the XDK with OAuth1 for all endpoints that work, and a direct `fetch` with manual OAuth1 header signing for the APPEND step only. The INIT, FINALIZE, and POST steps all go through the XDK normally.
+
+See the complete working implementation in [typescript-patterns.md](typescript-patterns.md) under "Media Upload (OAuth1 Workaround)".
+
 ## Best Practices
 
 1. **Always specify fields** - Never rely on defaults. Request exactly what you need to minimize payload and billing.

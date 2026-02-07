@@ -463,27 +463,199 @@ for await (const post of searchResults) {
 }
 ```
 
-## Media
+## Media Upload (OAuth1 Workaround)
+
+**IMPORTANT:** The TypeScript XDK has a bug with OAuth1 authentication where the body stream is consumed during signature computation, causing `client.media.upload()` and `client.media.appendUpload()` to fail with `Body is unusable: Body has already been read`. Use the hybrid approach below.
+
+The workaround uses the XDK for all steps that work (INIT, FINALIZE, POST) and a direct `fetch` with manual OAuth1 header signing for the APPEND step only.
+
+### v2 API Chunked Upload Endpoints
+
+| Step | Endpoint | XDK Works? |
+|---|---|---|
+| INIT | `POST /2/media/upload/initialize` | Yes (metadata only) |
+| APPEND | `POST /2/media/upload/{mediaId}/append` | **No** (binary body) |
+| FINALIZE | `POST /2/media/upload/{mediaId}/finalize` | Yes (no body) |
+
+### OAuth1 Header Signing Helper
+
+For the APPEND step, we sign only the HTTP method, URL, and OAuth parameters (not the JSON body -- per the OAuth1 spec, body params in `application/json` requests are not included in the signature base string).
 
 ```typescript
-// Upload media (one-shot for small files)
-const upload = await client.media.upload({
-  media: fileBuffer,
-  mediaType: 'image/jpeg',
+import crypto from "crypto";
+
+interface OAuth1Credentials {
+  apiKey: string;
+  apiSecret: string;
+  accessToken: string;
+  accessTokenSecret: string;
+}
+
+function generateOAuth1Header(
+  method: string,
+  url: string,
+  creds: OAuth1Credentials,
+): string {
+  const oauthParams: Record<string, string> = {
+    oauth_consumer_key: creds.apiKey,
+    oauth_nonce: crypto.randomBytes(16).toString("hex"),
+    oauth_signature_method: "HMAC-SHA1",
+    oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
+    oauth_token: creds.accessToken,
+    oauth_version: "1.0",
+  };
+
+  // Signature base string: METHOD&URL&sorted_params (body NOT included for JSON requests)
+  const paramString = Object.keys(oauthParams)
+    .sort()
+    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(oauthParams[k])}`)
+    .join("&");
+
+  const baseString = [
+    method.toUpperCase(),
+    encodeURIComponent(url),
+    encodeURIComponent(paramString),
+  ].join("&");
+
+  const signingKey = [
+    encodeURIComponent(creds.apiSecret),
+    encodeURIComponent(creds.accessTokenSecret),
+  ].join("&");
+
+  oauthParams.oauth_signature = crypto
+    .createHmac("sha1", signingKey)
+    .update(baseString)
+    .digest("base64");
+
+  const header = Object.keys(oauthParams)
+    .sort()
+    .map((k) => `${encodeURIComponent(k)}="${encodeURIComponent(oauthParams[k])}"`)
+    .join(", ");
+
+  return `OAuth ${header}`;
+}
+```
+
+### Complete Upload Flow: Image with Post
+
+```typescript
+import fs from "fs";
+import { Client, OAuth1 } from "@xdevplatform/xdk";
+
+// --- Setup ---
+const creds: OAuth1Credentials = {
+  apiKey: process.env.X_API_KEY!,
+  apiSecret: process.env.X_API_KEY_SECRET!,
+  accessToken: process.env.X_ACCESS_TOKEN!,
+  accessTokenSecret: process.env.X_ACCESS_TOKEN_SECRET!,
+};
+
+const oauth1 = new OAuth1({
+  apiKey: creds.apiKey,
+  apiSecret: creds.apiSecret,
+  accessToken: creds.accessToken,
+  accessTokenSecret: creds.accessTokenSecret,
+});
+const client = new Client({ oauth1 });
+
+// --- Step 1: INIT via XDK (metadata only, no binary -- works fine) ---
+const filePath = "image.jpg";
+const fileBytes = fs.readFileSync(filePath);
+const totalBytes = fileBytes.length;
+
+const initResponse = await client.media.initializeUpload({
+  totalBytes,
+  mediaType: "image/jpeg",       // or "video/mp4", "image/png", etc.
+  mediaCategory: "tweet_image",  // "tweet_video" for video, "tweet_gif" for GIF
+});
+const mediaId = initResponse.id;
+console.log("INIT complete, mediaId:", mediaId);
+
+// --- Step 2: APPEND via direct fetch (workaround for body-read bug) ---
+const appendUrl = `https://api.x.com/2/media/upload/${mediaId}/append`;
+const base64Media = fileBytes.toString("base64");
+
+const appendResponse = await fetch(appendUrl, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: generateOAuth1Header("POST", appendUrl, creds),
+  },
+  body: JSON.stringify({
+    media: base64Media,
+    segment_index: 0,
+  }),
 });
 
-// Chunked upload for large files
-const init = await client.media.initializeUpload({
-  totalBytes: fileSize,
-  mediaType: 'video/mp4',
+if (!appendResponse.ok) {
+  const errorText = await appendResponse.text();
+  throw new Error(`APPEND failed (${appendResponse.status}): ${errorText}`);
+}
+console.log("APPEND complete");
+
+// --- Step 3: FINALIZE via XDK (no body -- works fine) ---
+const finalizeResponse = await client.media.finalizeUpload(mediaId);
+console.log("FINALIZE complete:", finalizeResponse);
+
+// --- Step 4: POST via XDK (small JSON body -- works fine) ---
+const postResponse = await client.posts.create({
+  text: "Hello with an image!",
+  media: { media_ids: [mediaId] },
 });
-await client.media.appendUpload(init.mediaId, chunk1, 0);
-await client.media.appendUpload(init.mediaId, chunk2, 1);
-const finalized = await client.media.finalizeUpload(init.mediaId);
+console.log("Post created:", postResponse.data?.id);
+```
 
-// Check upload status
-const status = await client.media.getUploadStatus(mediaId);
+### Chunked Upload for Large Files (Video)
 
+For files larger than a single chunk (e.g., video), split into multiple APPEND segments:
+
+```typescript
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB per chunk
+
+// INIT
+const videoBytes = fs.readFileSync("video.mp4");
+const initRes = await client.media.initializeUpload({
+  totalBytes: videoBytes.length,
+  mediaType: "video/mp4",
+  mediaCategory: "tweet_video",
+});
+const videoMediaId = initRes.id;
+
+// APPEND each chunk
+const totalChunks = Math.ceil(videoBytes.length / CHUNK_SIZE);
+for (let i = 0; i < totalChunks; i++) {
+  const chunk = videoBytes.subarray(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+  const appendUrl = `https://api.x.com/2/media/upload/${videoMediaId}/append`;
+
+  const res = await fetch(appendUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: generateOAuth1Header("POST", appendUrl, creds),
+    },
+    body: JSON.stringify({
+      media: chunk.toString("base64"),
+      segment_index: i,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`APPEND chunk ${i} failed (${res.status}): ${await res.text()}`);
+  }
+  console.log(`APPEND chunk ${i + 1}/${totalChunks} complete`);
+}
+
+// FINALIZE
+const finalRes = await client.media.finalizeUpload(videoMediaId);
+console.log("FINALIZE complete:", finalRes);
+
+// For video, poll processing status until complete
+// (finalizeUpload may return a processing_info object with check_after_secs)
+```
+
+### Other Media Operations (Work Fine with OAuth1)
+
+```typescript
 // Get media by key
 const media = await client.media.getByKey('3_1234567890', {
   mediaFields: ['url', 'preview_image_url', 'type'],
