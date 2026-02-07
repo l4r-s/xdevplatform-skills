@@ -1,5 +1,5 @@
 ---
-name: xdk
+name: xdevplatform-xdk
 description: Build applications with the X API using the official TypeScript and Python XDKs. Provides SDK setup, authentication, pagination, streaming, and best practices. Use when the user mentions "X API", "XDK", "Twitter API", "post", "tweet", "stream", "filtered stream", "TypeScript SDK", "Python SDK", "@xdevplatform/xdk", or wants to interact with the X platform programmatically.
 ---
 
